@@ -1,6 +1,7 @@
 const express = require("express");
 const { z } = require("zod");
 const prisma = require("../db");
+const { requireAuth } = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -15,6 +16,11 @@ const querySchema = z.object({
   sort: z.enum(["newest", "price_asc", "price_desc", "discount"]).default("newest"),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(50).default(12),
+});
+
+const reviewSchema = z.object({
+  rating: z.number().int().min(1).max(5),
+  comment: z.string().trim().min(3, "Comment must be at least 3 characters").max(500),
 });
 
 const sortMap = {
@@ -32,7 +38,7 @@ const addPrice = (p) => ({
 router.get("/meta/filters", async (req, res) => {
   try {
     const categories = await prisma.category.findMany({
-      select: { id: true, name: true },
+      include: { children: true },
       orderBy: { id: "asc" },
     });
     const rows = await prisma.product.findMany({
@@ -59,10 +65,26 @@ router.get("/", async (req, res) => {
     where.OR = [
       { name: { contains: q.search, mode: "insensitive" } },
       { brand: { contains: q.search, mode: "insensitive" } },
+      { processor: { contains: q.search, mode: "insensitive" } },
+      { description: { contains: q.search, mode: "insensitive" } },
     ];
   }
   if (q.brand) where.brand = { equals: q.brand, mode: "insensitive" };
-  if (q.category) where.categoryId = q.category;
+
+  if (q.category) {
+    // Check if category has children subcategories
+    const catWithSubs = await prisma.category.findUnique({
+      where: { id: q.category },
+      include: { children: true },
+    });
+    if (catWithSubs && catWithSubs.children.length > 0) {
+      const childIds = catWithSubs.children.map((c) => c.id);
+      where.categoryId = { in: [q.category, ...childIds] };
+    } else {
+      where.categoryId = q.category;
+    }
+  }
+
   if (q.ram) where.ram = { gte: q.ram };
   if (q.network) where.network = q.network;
   if (q.minPrice !== undefined || q.maxPrice !== undefined) {
@@ -78,7 +100,7 @@ router.get("/", async (req, res) => {
       orderBy: sortMap[q.sort],
       skip: (q.page - 1) * q.limit,
       take: q.limit,
-      include: { category: { select: { id: true, name: true } } },
+      include: { category: { select: { id: true, name: true, parentId: true } } },
     });
     res.json({
       products: products.map(addPrice),
@@ -101,7 +123,7 @@ router.get("/:id", async (req, res) => {
     const product = await prisma.product.findUnique({
       where: { id },
       include: {
-        category: { select: { id: true, name: true } },
+        category: { select: { id: true, name: true, parentId: true } },
         reviews: {
           orderBy: { createdAt: "desc" },
           select: {
@@ -109,7 +131,7 @@ router.get("/:id", async (req, res) => {
             rating: true,
             comment: true,
             createdAt: true,
-            user: { select: { name: true } },
+            user: { select: { id: true, name: true } },
           },
         },
       },
@@ -119,12 +141,49 @@ router.get("/:id", async (req, res) => {
     }
     const count = product.reviews.length;
     const avgRating = count
-      ? product.reviews.reduce((sum, r) => sum + r.rating, 0) / count
-      : null;
+      ? Number((product.reviews.reduce((sum, r) => sum + r.rating, 0) / count).toFixed(1))
+      : 0;
     res.json({ product: { ...addPrice(product), avgRating, reviewCount: count } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not load product" });
+  }
+});
+
+// Add Review (Authenticated Customers)
+router.post("/:id/reviews", requireAuth, async (req, res) => {
+  const productId = Number(req.params.id);
+  if (!Number.isInteger(productId) || productId <= 0) {
+    return res.status(400).json({ error: "Invalid product id" });
+  }
+
+  const parsed = reviewSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0].message });
+  }
+
+  try {
+    const product = await prisma.product.findUnique({ where: { id: productId } });
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const review = await prisma.review.create({
+      data: {
+        rating: parsed.data.rating,
+        comment: parsed.data.comment,
+        userId: req.user.id,
+        productId,
+      },
+      include: {
+        user: { select: { name: true } },
+      },
+    });
+
+    res.status(201).json({ review });
+  } catch (err) {
+    console.error("Add review error:", err);
+    res.status(500).json({ error: "Failed to submit review" });
   }
 });
 
