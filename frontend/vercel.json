@@ -1,0 +1,8 @@
+{
+    "rewrites": [
+        {
+            "source": "/api/:path*",
+            "destination": "https://smartphone-store-backend.vercel.app/api/:path*"
+        }
+    ]
+}
